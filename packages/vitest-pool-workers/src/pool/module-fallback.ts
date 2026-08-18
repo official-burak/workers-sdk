@@ -769,10 +769,12 @@ async function handleV1ModuleFallbackRequest(
 
 type V2ResolveMethod = ResolveMethod | "internal";
 
-// These modules are loaded natively before Vitest's Vite module runner exists.
-// Treat them as entry points to the internal graph linked by
-// `linkV2VitestModule()` so every module shares the same Vitest singleton state.
-const vitestBootstrapEntrySpecifiers = new Set([
+// Workerd loads these modules before Vitest's Vite module runner exists. Their
+// imports overlap with modules later loaded through Vite, but Workerd identifies
+// instances by module name. Canonicalise imports reachable from these entry
+// points so the native and Vite-resolved paths share Vitest's stateful modules
+// instead of creating separate instances.
+const vitestNativeEntrySpecifiers = new Set([
 	"vitest/worker",
 	"cloudflare:snapshot",
 ]);
@@ -964,7 +966,7 @@ async function handleV2ModuleFallbackRequest(
 			referrer
 		);
 		if (
-			vitestBootstrapEntrySpecifiers.has(specifier) ||
+			vitestNativeEntrySpecifiers.has(specifier) ||
 			vitestModulePaths.has(referrer)
 		) {
 			vitestModulePaths.add(filePath);
