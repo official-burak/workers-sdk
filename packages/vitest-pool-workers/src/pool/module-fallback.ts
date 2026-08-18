@@ -769,7 +769,13 @@ async function handleV1ModuleFallbackRequest(
 
 type V2ResolveMethod = ResolveMethod | "internal";
 
-const vitestRootSpecifiers = new Set(["vitest/worker", "cloudflare:snapshot"]);
+// These modules are loaded natively before Vitest's Vite module runner exists.
+// Treat them as entry points to the internal graph linked by
+// `linkV2VitestModule()` so every module shares the same Vitest singleton state.
+const vitestBootstrapEntrySpecifiers = new Set([
+	"vitest/worker",
+	"cloudflare:snapshot",
+]);
 const v2VitestModulePaths = new WeakMap<Vite.ViteDevServer, Set<string>>();
 
 /** Resolves a V2 request to a local module path. */
@@ -958,7 +964,7 @@ async function handleV2ModuleFallbackRequest(
 			referrer
 		);
 		if (
-			vitestRootSpecifiers.has(specifier) ||
+			vitestBootstrapEntrySpecifiers.has(specifier) ||
 			vitestModulePaths.has(referrer)
 		) {
 			vitestModulePaths.add(filePath);
