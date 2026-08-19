@@ -7,11 +7,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import util from "node:util";
 import * as cjsModuleLexer from "cjs-module-lexer";
 import * as esModuleLexer from "es-module-lexer";
-import { parseModuleFallbackRequest, Response } from "miniflare";
+import { parseModuleFallbackRequest, Response, testRegExps } from "miniflare";
 import { workerdBuiltinModules } from "../shared/builtin-modules";
 import { ENCODED_PATH_PREFIX } from "../shared/module-path";
 import { isFileNotFoundError } from "./helpers";
 import type {
+	CompiledModuleRule,
 	Request,
 	V2ModuleFallbackRequest,
 	Worker_Module,
@@ -322,6 +323,9 @@ async function viteResolve(
 }
 
 const wasmModuleSuffix = ".wasm?module";
+// Workerd can request the `?module` adapter under the underlying WASM file's
+// normalised URL. Give the native module a distinct internal URL to avoid a cycle.
+const v2CompiledWasmPathSuffix = ".__mf_vitest_compiled_wasm";
 
 type ResolveMethod = "import" | "require";
 async function resolve(
@@ -649,7 +653,8 @@ async function load(
 /** Dispatches module fallback requests using Workerd's selected protocol. */
 export async function handleModuleFallbackRequest(
 	vite: Vite.ViteDevServer,
-	request: Request
+	request: Request,
+	moduleRules: CompiledModuleRule[] = []
 ): Promise<Response> {
 	const parsed = await parseModuleFallbackRequest(request);
 	if (parsed === null) {
@@ -657,7 +662,7 @@ export async function handleModuleFallbackRequest(
 	}
 	return parsed.protocol === "v1"
 		? handleV1ModuleFallbackRequest(vite, request)
-		: handleV2ModuleFallbackRequest(vite, parsed);
+		: handleV2ModuleFallbackRequest(vite, parsed, moduleRules);
 }
 
 /** Handles the legacy V1 fallback protocol. */
@@ -792,6 +797,12 @@ async function resolveV2(
 	if (isRequire && target.endsWith(wasmModuleSuffix)) {
 		target = trimSuffix("?module", target);
 	}
+	if (target.endsWith(v2CompiledWasmPathSuffix)) {
+		const wasmPath = trimSuffix(v2CompiledWasmPathSuffix, target);
+		if (isFile(wasmPath)) {
+			return target;
+		}
+	}
 
 	const forcedTypeMatch = forceModuleTypeRegexp.exec(target);
 	if (
@@ -877,16 +888,26 @@ async function loadV2Module(
 	logBase: string,
 	method: V2ResolveMethod,
 	specifier: string,
-	filePath: string
+	filePath: string,
+	moduleRules: CompiledModuleRule[]
 ): Promise<LoadedV2Module> {
+	if (filePath.endsWith(v2CompiledWasmPathSuffix)) {
+		const wasmPath = trimSuffix(v2CompiledWasmPathSuffix, filePath);
+		debuglog(logBase, "wasm:", wasmPath);
+		return { contents: { wasm: fs.readFileSync(wasmPath) } };
+	}
+
 	if (
 		method === "require" &&
 		specifier.endsWith(wasmModuleSuffix) &&
 		filePath.endsWith(".wasm")
 	) {
-		const wrapper = `module.exports = { default: require(${JSON.stringify(pathToModuleUrl(filePath))}) };`;
+		const moduleSpecifier = JSON.stringify(
+			pathToModuleUrl(filePath + v2CompiledWasmPathSuffix)
+		);
+		const wrapper = `import wasm from ${moduleSpecifier}; export default wasm;`;
 		debuglog(logBase, "wasm-module-wrapper:", filePath);
-		return { contents: { commonJsModule: wrapper } };
+		return { contents: { esModule: wrapper } };
 	}
 
 	if (filePath.endsWith(".wasm")) {
@@ -897,6 +918,30 @@ async function loadV2Module(
 	if (maybeContents !== undefined) {
 		debuglog(logBase, "forced:", filePath);
 		return { contents: maybeContents };
+	}
+
+	// V2 static imports reach the fallback service before Vitest's module runner
+	// can encode the matching module rule in the URL.
+	const moduleRule = moduleRules.find((rule) =>
+		testRegExps(rule.include, filePath)
+	);
+	if (moduleRule !== undefined) {
+		const ruleContents = maybeGetForceTypeModuleContents(
+			`${filePath}?mf_vitest_force=${moduleRule.type}`
+		);
+		assert(ruleContents !== undefined);
+		debuglog(logBase, "module-rule:", moduleRule.type, filePath);
+		if ("commonJsModule" in ruleContents) {
+			return {
+				contents: ruleContents,
+				namedExports: await getCjsNamedExports(
+					vite,
+					filePath,
+					ruleContents.commonJsModule
+				),
+			};
+		}
+		return { contents: ruleContents };
 	}
 
 	const isEsm =
@@ -941,7 +986,8 @@ function getV2RequestSpecifier(
 /** Handles a parsed V2 fallback request. */
 async function handleV2ModuleFallbackRequest(
 	vite: Vite.ViteDevServer,
-	request: V2ModuleFallbackRequest
+	request: V2ModuleFallbackRequest,
+	moduleRules: CompiledModuleRule[]
 ): Promise<Response> {
 	if (request.referrer === undefined) {
 		return new Response("Invalid module fallback request", { status: 400 });
@@ -984,7 +1030,8 @@ async function handleV2ModuleFallbackRequest(
 			logBase,
 			request.type,
 			specifier,
-			filePath
+			filePath,
+			moduleRules
 		);
 		if ("esModule" in module.contents && vitestModulePaths.has(filePath)) {
 			module.contents.esModule = await linkV2VitestModule(

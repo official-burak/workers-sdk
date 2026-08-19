@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { removeDirSync } from "@cloudflare/workers-utils";
-import { Request } from "miniflare";
+import { compileModuleRules, Request } from "miniflare";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import {
 	decodeEncodedSpecifier,
@@ -520,6 +520,82 @@ describe("handleModuleFallbackRequest new module registry", () => {
 		expect(await response.json()).toEqual({
 			name: specifier,
 			text: contents,
+		});
+	});
+
+	it("applies configured module rules to native imports", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.sql");
+		const contents = "SELECT 1;";
+		fs.writeFileSync(filePath, contents);
+		const specifier = pathToFileURL(filePath).href;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier,
+				rawSpecifier: "./module.sql",
+				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+			}),
+			compileModuleRules([{ type: "Text", include: ["**/*.sql"] }])
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			text: contents,
+		});
+	});
+
+	it("adapts required wasm modules without replacing the native module", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.wasm");
+		fs.writeFileSync(filePath, "");
+		const specifier = pathToFileURL(filePath).href;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "require",
+				specifier,
+				rawSpecifier: "./module.wasm?module",
+				referrer: pathToFileURL(path.join(tmp, "module.cjs")).href,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			esModule: `import wasm from ${JSON.stringify(`${specifier}.__mf_vitest_compiled_wasm`)}; export default wasm;`,
+		});
+	});
+
+	it("loads the native wasm module behind a require adapter", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.wasm");
+		fs.writeFileSync(filePath, "wasm");
+		const specifier = pathToFileURL(
+			`${filePath}.__mf_vitest_compiled_wasm`
+		).href;
+
+		const response = await handleModuleFallbackRequest(
+			fakeVite(),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier,
+				rawSpecifier: specifier,
+				referrer: `${pathToFileURL(filePath).href}?module`,
+			})
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			name: specifier,
+			wasm: [119, 97, 115, 109],
 		});
 	});
 
