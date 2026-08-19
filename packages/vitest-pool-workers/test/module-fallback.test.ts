@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { removeDirSync } from "@cloudflare/workers-utils";
-import { compileModuleRules, Request } from "miniflare";
+import { Request } from "miniflare";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import {
 	decodeEncodedSpecifier,
@@ -523,9 +523,7 @@ describe("handleModuleFallbackRequest new module registry", () => {
 		});
 	});
 
-	it("applies configured module rules to native imports", async ({
-		expect,
-	}) => {
+	it("uses module types selected by Vite", async ({ expect }) => {
 		const filePath = path.join(tmp, "module.sql");
 		const contents = "SELECT 1;";
 		fs.writeFileSync(filePath, contents);
@@ -536,10 +534,9 @@ describe("handleModuleFallbackRequest new module registry", () => {
 			v2ModuleFallbackRequest({
 				type: "import",
 				specifier,
-				rawSpecifier: "./module.sql",
+				rawSpecifier: `${filePath}?mf_vitest_force=Text`,
 				referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
-			}),
-			compileModuleRules([{ type: "Text", include: ["**/*.sql"] }])
+			})
 		);
 
 		expect(response.status).toBe(200);
@@ -547,6 +544,56 @@ describe("handleModuleFallbackRequest new module registry", () => {
 			name: specifier,
 			text: contents,
 		});
+	});
+
+	it("preserves query and fragment identity while reading the file path", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.mjs");
+		const contents = "export const value = 42;";
+		fs.writeFileSync(filePath, contents);
+		const baseSpecifier = pathToFileURL(filePath).href;
+
+		for (const suffix of ["?variant", "#one", "#two", "?variant#three"]) {
+			const specifier = baseSpecifier + suffix;
+			const response = await handleModuleFallbackRequest(
+				fakeVite(),
+				v2ModuleFallbackRequest({
+					type: "import",
+					specifier,
+					rawSpecifier: `./module.mjs${suffix}`,
+					referrer: pathToFileURL(path.join(tmp, "entry.mjs")).href,
+				})
+			);
+
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({
+				name: specifier,
+				esModule: contents,
+			});
+		}
+	});
+
+	it("preserves query and fragment identity in canonical redirects", async ({
+		expect,
+	}) => {
+		const filePath = path.join(tmp, "module.mjs");
+		const resolvedId = `${filePath}?variant#fragment`;
+
+		const response = await handleModuleFallbackRequest(
+			fakeViteResolvingTo(resolvedId),
+			v2ModuleFallbackRequest({
+				type: "import",
+				specifier: "file:///bundle/module?variant#fragment",
+				rawSpecifier: "module?variant#fragment",
+				referrer: "file:///bundle/entry.mjs",
+			})
+		);
+
+		expect(response.status).toBe(301);
+		expect(response.headers.get("Location")).toBe(
+			`${pathToFileURL(filePath).href}?variant#fragment`
+		);
 	});
 
 	it("adapts required wasm modules without replacing the native module", async ({

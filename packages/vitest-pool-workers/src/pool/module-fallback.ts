@@ -7,12 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import util from "node:util";
 import * as cjsModuleLexer from "cjs-module-lexer";
 import * as esModuleLexer from "es-module-lexer";
-import { parseModuleFallbackRequest, Response, testRegExps } from "miniflare";
+import { parseModuleFallbackRequest, Response } from "miniflare";
 import { workerdBuiltinModules } from "../shared/builtin-modules";
 import { ENCODED_PATH_PREFIX } from "../shared/module-path";
 import { isFileNotFoundError } from "./helpers";
 import type {
-	CompiledModuleRule,
 	Request,
 	V2ModuleFallbackRequest,
 	Worker_Module,
@@ -653,8 +652,7 @@ async function load(
 /** Dispatches module fallback requests using Workerd's selected protocol. */
 export async function handleModuleFallbackRequest(
 	vite: Vite.ViteDevServer,
-	request: Request,
-	moduleRules: CompiledModuleRule[] = []
+	request: Request
 ): Promise<Response> {
 	const parsed = await parseModuleFallbackRequest(request);
 	if (parsed === null) {
@@ -662,7 +660,7 @@ export async function handleModuleFallbackRequest(
 	}
 	return parsed.protocol === "v1"
 		? handleV1ModuleFallbackRequest(vite, request)
-		: handleV2ModuleFallbackRequest(vite, parsed, moduleRules);
+		: handleV2ModuleFallbackRequest(vite, parsed);
 }
 
 /** Handles the legacy V1 fallback protocol. */
@@ -794,27 +792,28 @@ async function resolveV2(
 	referrer: string
 ): Promise<string> {
 	const isRequire = method === "require";
-	if (isRequire && target.endsWith(wasmModuleSuffix)) {
-		target = trimSuffix("?module", target);
+	const { filePath: targetPath, suffix } = splitModulePath(target);
+	let targetSuffix = suffix;
+	if (
+		isRequire &&
+		(targetSuffix === "?module" || targetSuffix.startsWith("?module#"))
+	) {
+		targetSuffix = targetSuffix.slice("?module".length);
 	}
-	if (target.endsWith(v2CompiledWasmPathSuffix)) {
-		const wasmPath = trimSuffix(v2CompiledWasmPathSuffix, target);
+	if (targetPath.endsWith(v2CompiledWasmPathSuffix)) {
+		const wasmPath = trimSuffix(v2CompiledWasmPathSuffix, targetPath);
 		if (isFile(wasmPath)) {
-			return target;
+			return targetPath + targetSuffix;
 		}
 	}
 
-	const forcedTypeMatch = forceModuleTypeRegexp.exec(target);
-	if (
-		forcedTypeMatch !== null &&
-		isFile(trimSuffix(forcedTypeMatch[0], target))
-	) {
-		return target;
+	if (getV2ForcedModuleType(target) !== undefined && isFile(targetPath)) {
+		return targetPath + targetSuffix;
 	}
 
-	let filePath = maybeGetTargetFilePath(target, isRequire);
+	let filePath = maybeGetTargetFilePath(targetPath, isRequire);
 	if (filePath !== undefined) {
-		return filePath;
+		return filePath + targetSuffix;
 	}
 
 	const specifierLibPath = posixPath.join(
@@ -845,18 +844,61 @@ function moduleUrlToResolutionTarget(specifier: string): string {
 		return specifier;
 	}
 	const filePath = ensurePosixLikePath(fileURLToPath(url));
-	return decodeEncodedSpecifier(filePath) + url.search;
+	return decodeEncodedSpecifier(filePath) + url.search + url.hash;
 }
 
-/** Converts a local module path, including any query, into a file URL. */
-function pathToModuleUrl(filePath: string): string {
-	const queryIndex = filePath.indexOf("?");
+type SplitModulePath = {
+	filePath: string;
+	suffix: string;
+};
+
+/** Separates a local filesystem path from its URL query and fragment. */
+function splitModulePath(modulePath: string): SplitModulePath {
+	const queryIndex = modulePath.indexOf("?");
+	const hashIndex = modulePath.indexOf("#");
+	let suffixIndex = -1;
 	if (queryIndex === -1) {
-		return pathToFileURL(filePath).href;
+		suffixIndex = hashIndex;
+	} else if (hashIndex === -1) {
+		suffixIndex = queryIndex;
+	} else {
+		suffixIndex = Math.min(queryIndex, hashIndex);
 	}
+	return suffixIndex === -1
+		? { filePath: modulePath, suffix: "" }
+		: {
+				filePath: modulePath.slice(0, suffixIndex),
+				suffix: modulePath.slice(suffixIndex),
+			};
+}
+
+/** Converts a local module path, including any query or fragment, into a URL. */
+function pathToModuleUrl(filePath: string): string {
+	const split = splitModulePath(filePath);
+	return pathToFileURL(split.filePath).href + split.suffix;
+}
+
+/** Reads Vite's private module-type marker without making it module identity. */
+function getV2ForcedModuleType(
+	specifier: string
+): LegacyModuleRuleType | undefined {
+	const { suffix } = splitModulePath(specifier);
+	const match = /^\?mf_vitest_force=([^#]+)(?:#.*)?$/.exec(suffix);
+	if (
+		match === null ||
+		!legacyModuleRuleTypes.includes(match[1] as LegacyModuleRuleType)
+	) {
+		return;
+	}
+	return match[1] as LegacyModuleRuleType;
+}
+
+/** Checks for Vite's `?module` WebAssembly adapter request. */
+function isV2WasmModuleSpecifier(specifier: string): boolean {
+	const { filePath, suffix } = splitModulePath(specifier);
 	return (
-		pathToFileURL(filePath.slice(0, queryIndex)).href +
-		filePath.slice(queryIndex)
+		filePath.endsWith(".wasm") &&
+		(suffix === "?module" || suffix.startsWith("?module#"))
 	);
 }
 
@@ -888,9 +930,9 @@ async function loadV2Module(
 	logBase: string,
 	method: V2ResolveMethod,
 	specifier: string,
-	filePath: string,
-	moduleRules: CompiledModuleRule[]
+	modulePath: string
 ): Promise<LoadedV2Module> {
+	const { filePath } = splitModulePath(modulePath);
 	if (filePath.endsWith(v2CompiledWasmPathSuffix)) {
 		const wasmPath = trimSuffix(v2CompiledWasmPathSuffix, filePath);
 		debuglog(logBase, "wasm:", wasmPath);
@@ -899,7 +941,7 @@ async function loadV2Module(
 
 	if (
 		method === "require" &&
-		specifier.endsWith(wasmModuleSuffix) &&
+		isV2WasmModuleSpecifier(specifier) &&
 		filePath.endsWith(".wasm")
 	) {
 		const moduleSpecifier = JSON.stringify(
@@ -910,27 +952,14 @@ async function loadV2Module(
 		return { contents: { esModule: wrapper } };
 	}
 
-	if (filePath.endsWith(".wasm")) {
-		filePath += `?mf_vitest_force=CompiledWasm`;
-	}
-
-	const maybeContents = maybeGetForceTypeModuleContents(filePath);
-	if (maybeContents !== undefined) {
-		debuglog(logBase, "forced:", filePath);
-		return { contents: maybeContents };
-	}
-
-	// V2 static imports reach the fallback service before Vitest's module runner
-	// can encode the matching module rule in the URL.
-	const moduleRule = moduleRules.find((rule) =>
-		testRegExps(rule.include, filePath)
-	);
-	if (moduleRule !== undefined) {
+	const forcedType =
+		getV2ForcedModuleType(modulePath) ?? getV2ForcedModuleType(specifier);
+	if (forcedType !== undefined) {
 		const ruleContents = maybeGetForceTypeModuleContents(
-			`${filePath}?mf_vitest_force=${moduleRule.type}`
+			`${filePath}?mf_vitest_force=${forcedType}`
 		);
 		assert(ruleContents !== undefined);
-		debuglog(logBase, "module-rule:", moduleRule.type, filePath);
+		debuglog(logBase, "forced:", forcedType, filePath);
 		if ("commonJsModule" in ruleContents) {
 			return {
 				contents: ruleContents,
@@ -942,6 +971,15 @@ async function loadV2Module(
 			};
 		}
 		return { contents: ruleContents };
+	}
+
+	if (filePath.endsWith(".wasm")) {
+		const contents = maybeGetForceTypeModuleContents(
+			`${filePath}?mf_vitest_force=CompiledWasm`
+		);
+		assert(contents !== undefined);
+		debuglog(logBase, "forced:", filePath);
+		return { contents };
 	}
 
 	const isEsm =
@@ -986,8 +1024,7 @@ function getV2RequestSpecifier(
 /** Handles a parsed V2 fallback request. */
 async function handleV2ModuleFallbackRequest(
 	vite: Vite.ViteDevServer,
-	request: V2ModuleFallbackRequest,
-	moduleRules: CompiledModuleRule[]
+	request: V2ModuleFallbackRequest
 ): Promise<Response> {
 	if (request.referrer === undefined) {
 		return new Response("Invalid module fallback request", { status: 400 });
@@ -1030,8 +1067,7 @@ async function handleV2ModuleFallbackRequest(
 			logBase,
 			request.type,
 			specifier,
-			filePath,
-			moduleRules
+			filePath
 		);
 		if ("esModule" in module.contents && vitestModulePaths.has(filePath)) {
 			module.contents.esModule = await linkV2VitestModule(

@@ -12,7 +12,6 @@ import * as devalue from "devalue";
 import getPort, { portNumbers } from "get-port";
 import {
 	convertV4MiniflareOptions,
-	compileModuleRules,
 	getNodeCompat,
 	kCurrentWorker,
 	kUnsafeEphemeralUniqueKey,
@@ -44,7 +43,6 @@ import type {
 	MiniflareOptions,
 	LegacyWorkerOptions,
 	V4MiniflareOptions,
-	V4ModuleRule,
 	WorkerdStructuredLog,
 } from "miniflare";
 import type { TestProject, Vitest } from "vitest/node";
@@ -647,30 +645,16 @@ function getFirstAvailablePort(start: number): Promise<number> {
 type ModuleFallbackService = NonNullable<
 	V4MiniflareOptions["unsafeModuleFallbackService"]
 >;
-// Reuse the same bound module fallback service for each module-rule set when
-// constructing Miniflare options, so deep equality checks succeed
-const moduleFallbackServices = new WeakMap<
-	Vitest,
-	Map<string, ModuleFallbackService>
->();
-function getModuleFallbackService(
-	ctx: Vitest,
-	moduleRules: V4ModuleRule[] = []
-): ModuleFallbackService {
-	let services = moduleFallbackServices.get(ctx);
-	if (services === undefined) {
-		services = new Map();
-		moduleFallbackServices.set(ctx, services);
-	}
-	const key = JSON.stringify(moduleRules);
-	let service = services.get(key);
+// Reuse the same bound module fallback service when constructing Miniflare
+// options, so deep equality checks succeed
+const moduleFallbackServices = new WeakMap<Vitest, ModuleFallbackService>();
+function getModuleFallbackService(ctx: Vitest): ModuleFallbackService {
+	let service = moduleFallbackServices.get(ctx);
 	if (service !== undefined) {
 		return service;
 	}
-	const compiledModuleRules = compileModuleRules(moduleRules);
-	service = (request) =>
-		handleModuleFallbackRequest(ctx.vite, request, compiledModuleRules);
-	services.set(key, service);
+	service = handleModuleFallbackRequest.bind(undefined, ctx.vite);
+	moduleFallbackServices.set(ctx, service);
 	return service;
 }
 
@@ -681,13 +665,10 @@ function getModuleFallbackService(
 async function buildProjectMiniflareOptions(
 	ctx: Vitest,
 	project: TestProject,
-	customOptions: WorkersPoolOptionsWithDefines,
+	customOptions: WorkersPoolOptions,
 	main: string | undefined
 ): Promise<MiniflareOptions> {
-	const moduleFallbackService = getModuleFallbackService(
-		ctx,
-		customOptions.moduleRules
-	);
+	const moduleFallbackService = getModuleFallbackService(ctx);
 	const [runnerWorker, ...auxiliaryWorkers] = await buildProjectWorkerOptions(
 		project,
 		customOptions,
