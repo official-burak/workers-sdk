@@ -843,7 +843,14 @@ function moduleUrlToResolutionTarget(specifier: string): string {
 	if (url.protocol !== "file:") {
 		return specifier;
 	}
-	const filePath = ensurePosixLikePath(fileURLToPath(url));
+	// Workerd uses root-anchored file URLs such as `file:///bundle/index.mjs`
+	// for its logical module namespace. These are valid module URLs, but Node's
+	// Windows fileURLToPath() rejects them because they don't contain a drive.
+	const isWindowsFilePath = /^\/[a-zA-Z]:\//.test(url.pathname);
+	const filePath =
+		isWindows && url.host === "" && !isWindowsFilePath
+			? decodeURIComponent(url.pathname)
+			: ensurePosixLikePath(fileURLToPath(url));
 	return decodeEncodedSpecifier(filePath) + url.search + url.hash;
 }
 
